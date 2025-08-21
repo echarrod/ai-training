@@ -15,7 +15,7 @@
 //
 // # Running the example:
 //
-//	$ make example06
+//	$ make example6
 //
 // # This requires running the following command:
 //
@@ -30,25 +30,23 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/ardanlabs/ai-training/foundation/client"
 	"github.com/ardanlabs/ai-training/foundation/mongodb"
+	"github.com/tmc/langchaingo/llms/ollama"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 const (
-	url        = "http://localhost:11434/v1/embeddings"
-	model      = "bge-m3:latest"
-	dbName     = "example06"
-	colName    = "book"
-	dimensions = 1024
+	url   = "http://localhost:11434"
+	model = "bge-m3:latest"
 )
 
 // =============================================================================
@@ -56,7 +54,7 @@ const (
 type document struct {
 	ID        int       `bson:"id"`
 	Text      string    `bson:"text"`
-	Embedding []float64 `bson:"embedding"`
+	Embedding []float32 `bson:"embedding"`
 }
 
 // =============================================================================
@@ -68,52 +66,50 @@ func main() {
 }
 
 func run() error {
+	if err := createEmbeddings(); err != nil {
+		return fmt.Errorf("createEmbeddings: %w", err)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	fmt.Println("\nCreating Embeddings")
-
-	if err := createBookEmbeddings(ctx); err != nil {
-		return fmt.Errorf("createBookEmbeddings: %w", err)
-	}
-
-	// -------------------------------------------------------------------------
-
-	fmt.Println("Initializing Database")
-
-	client, err := mongodb.Connect(ctx, "mongodb://localhost:27017", "ardan", "ardan")
+	col, err := setupDatabase(ctx)
 	if err != nil {
-		return fmt.Errorf("mongodb.Connect: %w", err)
+		return fmt.Errorf("setupDatabase: %w", err)
 	}
 
-	col, err := initDB(ctx, client)
-	if err != nil {
-		return fmt.Errorf("initDB: %w", err)
+	if err := insertEmbeddings(ctx, col); err != nil {
+		return fmt.Errorf("insertEmbeddings: %w", err)
 	}
-
-	// -------------------------------------------------------------------------
-
-	if err := insertBookEmbeddings(ctx, col); err != nil {
-		return fmt.Errorf("insertBookEmbeddings: %w", err)
-	}
-
-	fmt.Println("\nYou can now use example07 to ask questions about this content.")
 
 	return nil
 }
 
-func createBookEmbeddings(ctx context.Context) error {
-	llm := client.NewLLM(url, model)
+func createEmbeddings() error {
+	fmt.Println("\nCreated Embeddings")
 
+	// If the embeddings already exist, we don't need to do this again.
 	if _, err := os.Stat("zarf/data/book.embeddings"); err == nil {
 		return nil
 	}
 
-	data, err := os.ReadFile("zarf/data/book.chunks")
+	// Open a connection with ollama to access the model.
+	llm, err := ollama.New(
+		ollama.WithModel("bge-m3:latest"),
+		ollama.WithServerURL("http://localhost:11434"),
+	)
 	if err != nil {
-		return fmt.Errorf("read file: %w", err)
+		return fmt.Errorf("ollama: %w", err)
 	}
 
+	// Open the book file with the pre-processed chunks.
+	input, err := os.Open("zarf/data/book.chunks")
+	if err != nil {
+		return fmt.Errorf("open file: %w", err)
+	}
+	defer input.Close()
+
+	// Create the embeddings.
 	output, err := os.Create("zarf/data/book.embeddings")
 	if err != nil {
 		return fmt.Errorf("create file: %w", err)
@@ -122,6 +118,11 @@ func createBookEmbeddings(ctx context.Context) error {
 
 	fmt.Print("\n")
 	fmt.Print("\033[s")
+
+	data, err := io.ReadAll(input)
+	if err != nil {
+		return fmt.Errorf("read file: %w", err)
+	}
 
 	r := regexp.MustCompile(`<CHUNK>[\w\W]*?<\/CHUNK>`)
 	chunks := r.FindAllString(string(data), -1)
@@ -142,17 +143,20 @@ func createBookEmbeddings(ctx context.Context) error {
 		// TOKENS. THERE IS A TIKTOKEN PACKAGE IN FOUNDATION TO HELP YOU WITH
 		// THIS.
 
-		vector, err := llm.EmbedText(ctx, chunk)
+		// Get the vector embedding for this chunk.
+		embedding, err := llm.CreateEmbedding(context.Background(), []string{chunk})
 		if err != nil {
-			return fmt.Errorf("embedding: %w", err)
+			return fmt.Errorf("create embedding: %w", err)
 		}
 
+		// Create the document with the vector embedding.
 		doc := document{
 			ID:        counter,
 			Text:      chunk,
-			Embedding: vector,
+			Embedding: embedding[0],
 		}
 
+		// Convert to json.
 		data, err := json.Marshal(doc)
 		if err != nil {
 			return fmt.Errorf("marshal: %w", err)
@@ -174,7 +178,58 @@ func createBookEmbeddings(ctx context.Context) error {
 	return nil
 }
 
-func insertBookEmbeddings(ctx context.Context, col *mongo.Collection) error {
+func setupDatabase(ctx context.Context) (*mongo.Collection, error) {
+
+	// Connect to mongodb.
+	client, err := mongodb.Connect(ctx, "mongodb://localhost:27017", "ardan", "ardan")
+	if err != nil {
+		return nil, fmt.Errorf("connectToMongo: %w", err)
+	}
+
+	const dbName = "example5"
+	const collectionName = "book"
+
+	db := client.Database(dbName)
+
+	// Create database and collection.
+	col, err := mongodb.CreateCollection(ctx, db, collectionName)
+	if err != nil {
+		return nil, fmt.Errorf("createCollection: %w", err)
+	}
+
+	fmt.Println("Created Collection")
+
+	const indexName = "vector_index"
+	settings := mongodb.VectorIndexSettings{
+		NumDimensions: 1024,
+		Path:          "embedding",
+		Similarity:    "cosine",
+	}
+
+	// Create vector index.
+	if err := mongodb.CreateVectorIndex(ctx, col, indexName, settings); err != nil {
+		return nil, fmt.Errorf("createVectorIndex: %w", err)
+	}
+
+	fmt.Println("Created Vector Index")
+
+	unique := true
+	indexModel := mongo.IndexModel{
+		Keys:    bson.D{{Key: "id", Value: 1}},
+		Options: &options.IndexOptions{Unique: &unique},
+	}
+
+	// Create a unique index for the document.
+	col.Indexes().CreateOne(ctx, indexModel)
+
+	fmt.Println("Created Unique Index")
+
+	return col, nil
+}
+
+func insertEmbeddings(ctx context.Context, col *mongo.Collection) error {
+
+	// Open the book file with the pre-processed chunks.
 	input, err := os.Open("zarf/data/book.embeddings")
 	if err != nil {
 		return fmt.Errorf("open file: %w", err)
@@ -195,22 +250,26 @@ func insertBookEmbeddings(ctx context.Context, col *mongo.Collection) error {
 		doc := scanner.Text()
 
 		fmt.Print("\033[u\033[K")
-		fmt.Printf("Insering Data: %d", counter)
+		fmt.Printf("Inserting Data: %d", counter)
 
+		// Decode json to a go struct.
 		var d document
 		if err := json.Unmarshal([]byte(doc), &d); err != nil {
 			return fmt.Errorf("unmarshal: %w", err)
 		}
 
+		// Check if this document is already in the database.
 		res := col.FindOne(ctx, bson.D{{Key: "id", Value: d.ID}})
 		if res.Err() == nil {
 			continue
 		}
 
+		// We had an error the fact there are no documents.
 		if !errors.Is(res.Err(), mongo.ErrNoDocuments) {
 			return fmt.Errorf("find: %w", err)
 		}
 
+		// Insert the document into mongodb.
 		if _, err := col.InsertOne(ctx, d); err != nil {
 			return fmt.Errorf("insert: %w", err)
 		}
@@ -219,34 +278,4 @@ func insertBookEmbeddings(ctx context.Context, col *mongo.Collection) error {
 	fmt.Print("\n")
 
 	return nil
-}
-
-func initDB(ctx context.Context, client *mongo.Client) (*mongo.Collection, error) {
-	db := client.Database(dbName)
-
-	col, err := mongodb.CreateCollection(ctx, db, colName)
-	if err != nil {
-		return nil, fmt.Errorf("createCollection: %w", err)
-	}
-
-	const indexName = "vector_index"
-
-	settings := mongodb.VectorIndexSettings{
-		NumDimensions: dimensions,
-		Path:          "embedding",
-		Similarity:    "cosine",
-	}
-
-	if err := mongodb.CreateVectorIndex(ctx, col, indexName, settings); err != nil {
-		return nil, fmt.Errorf("createVectorIndex: %w", err)
-	}
-
-	unique := true
-	indexModel := mongo.IndexModel{
-		Keys:    bson.D{{Key: "id", Value: 1}},
-		Options: &options.IndexOptions{Unique: &unique},
-	}
-	col.Indexes().CreateOne(ctx, indexModel)
-
-	return col, nil
 }
