@@ -7,43 +7,51 @@
 //
 // # This requires running the following commands:
 //
-//	$ make ollama-up
-
+//	$ make ollama-up  // This starts the Ollama service.
 package main
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
-	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
-	"github.com/ardanlabs/ai-training/foundation/client"
 	"github.com/ardanlabs/ai-training/foundation/mongodb"
+	"github.com/dsoprea/go-exif/v3"
+	exifcommon "github.com/dsoprea/go-exif/v3/common"
+	jpg "github.com/dsoprea/go-jpeg-image-structure/v2"
+	pis "github.com/dsoprea/go-png-image-structure/v2"
+	"github.com/tmc/langchaingo/llms"
+	"github.com/tmc/langchaingo/llms/ollama"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 const (
-	urlChat    = "http://localhost:11434/v1/chat/completions"
-	urlEmbed   = "http://localhost:11434/v1/embeddings"
-	modelChat  = "qwen2.5vl:latest"
-	modelEmbed = "bge-m3:latest"
-	imagePath  = "cmd/samples/gallery/roseimg.png"
-	dbName     = "example9"
-	colName    = "images-4"
-	dimensions = 1024
+	url            = "http://localhost:11434"
+	model          = "qwen2.5vl:latest"
+	imagePath      = "cmd/samples/gallery/roseimg.png"
+	embedModel     = "bge-m3:latest"
+	dbName         = "example9"
+	collectionName = "images-4"
 )
-
-// =============================================================================
 
 type document struct {
 	FileName    string    `bson:"file_name"`
 	Description string    `bson:"description"`
-	Embedding   []float64 `bson:"embedding"`
+	Embedding   []float32 `bson:"embedding"`
+}
+
+type searchResult struct {
+	FileName    string    `bson:"file_name" json:"file_name"`
+	Description string    `bson:"description" json:"image_description"`
+	Embedding   []float32 `bson:"embedding" json:"-"`
+	Score       float64   `bson:"score" json:"-"`
 }
 
 // =============================================================================
@@ -55,101 +63,134 @@ func main() {
 }
 
 func run() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
-	defer cancel()
+	ctx := context.Background()
 
 	// -------------------------------------------------------------------------
 
-	fmt.Println("\nConnecting to MongoDB")
-
-	dbClient, err := mongodb.Connect(ctx, "mongodb://localhost:27017", "ardan", "ardan")
+	llm, err := ollama.New(
+		ollama.WithModel(model),
+		ollama.WithServerURL(url),
+	)
 	if err != nil {
-		return fmt.Errorf("connectToMongo: %w", err)
+		return fmt.Errorf("ollama: %w", err)
 	}
 
-	fmt.Println("Initializing Database")
-
-	col, err := initDB(ctx, dbClient)
+	llmEmbed, err := ollama.New(
+		ollama.WithModel(embedModel),
+		ollama.WithServerURL(url),
+	)
 	if err != nil {
-		return fmt.Errorf("initDB: %w", err)
+		return fmt.Errorf("ollama: %w", err)
 	}
+
+	// -------------------------------------------------------------------------
+
+	mongoClient, err := initDatabase(dbName, collectionName)
+	if err != nil {
+		return fmt.Errorf("initDatabase: %w", err)
+	}
+
+	col := mongoClient.Database(dbName).Collection(collectionName)
 
 	// -------------------------------------------------------------------------
 
 	findRes := col.FindOne(ctx, bson.D{{Key: "file_name", Value: imagePath}})
 	if findRes.Err() == nil {
-		fmt.Println("Deleting existing image from database")
+		fmt.Println("Delete existing image from database")
 		_, err := col.DeleteOne(ctx, bson.D{{Key: "file_name", Value: imagePath}})
 		if err != nil {
-			return fmt.Errorf("col.DeleteOne: %w", err)
+			return fmt.Errorf("delete image: %w", err)
 		}
 	}
 
 	// -------------------------------------------------------------------------
 
-	fmt.Println("\nGenerating image description:")
-
-	image, mimeType, err := readImage(imagePath)
+	data, mimeType, err := processImage(imagePath)
 	if err != nil {
-		return fmt.Errorf("readImage: %w", err)
+		return fmt.Errorf("process image: %w", err)
 	}
 
 	// -------------------------------------------------------------------------
 
-	const prompt = `
-		Describe the image and be concise and accurate keeping the description under 200 words.
+	fmt.Print("\nGenerating image description:\n\n")
 
-		Do not be overly verbose or stylistic.
-
-		Make sure all the elements in the image are enumerated and described.
-
-		At the end of the description, create a list of tags with the names of all the
-		elements in the image and do not output anything past this list.
-
+	prompt := `Describe the image. Be concise and accurate. Do not be overly
+		verbose or stylistic. Make sure all the elements in the image are
+		enumerated and described. Do not include any additional details. Keep
+		the description under 200 words. At the end of the description, create
+		a list of tags with the names of all the elements in the image. Do not
+		output anything past this list.
 		Encode the list as valid JSON, as in this example:
-		["tag1","tag2","tag3",...]
-
+		[
+			"tag1",
+			"tag2",
+			"tag3",
+			...
+		]
 		Make sure the JSON is valid, doesn't have any extra spaces, and is
 		properly formatted.`
 
-	llmChat := client.NewLLM(urlChat, modelChat)
-
-	results, err := llmChat.ChatCompletions(ctx, prompt, client.WithImage(mimeType, image))
-	if err != nil {
-		return fmt.Errorf("llmChat.ChatCompletions: %w", err)
+	messages := []llms.MessageContent{
+		{
+			Role: llms.ChatMessageTypeHuman,
+			Parts: []llms.ContentPart{
+				llms.BinaryContent{
+					MIMEType: mimeType,
+					Data:     data,
+				},
+				llms.TextContent{
+					Text: prompt,
+				},
+			},
+		},
 	}
 
-	fmt.Printf("%s\n", results)
+	cr, err := llm.GenerateContent(
+		ctx,
+		messages,
+		llms.WithMaxTokens(500),
+		llms.WithTemperature(1.0),
+	)
+	if err != nil {
+		return fmt.Errorf("generate content: %w", err)
+	}
+
+	fmt.Print(cr.Choices[0].Content)
+	fmt.Print("\n\n")
 
 	// -------------------------------------------------------------------------
 
-	fmt.Println("Generate embeddings for the image description:")
+	fmt.Print("Updating image description:\n\n")
 
-	llmEmbed := client.NewLLM(urlEmbed, modelEmbed)
-
-	vector, err := llmEmbed.EmbedText(ctx, results)
-	if err != nil {
-		return fmt.Errorf("llmEmbed.EmbedText: %w", err)
+	if err := updateImage(imagePath, cr.Choices[0].Content); err != nil {
+		return fmt.Errorf("update image: %w", err)
 	}
-
-	fmt.Printf("%v...%v\n", vector[0:3], vector[len(vector)-3:])
 
 	// -------------------------------------------------------------------------
 
-	fmt.Println("\nInserting image information into the database:")
+	fmt.Print("Generate embeddings for the image description:\n\n")
+
+	vectors, err := llmEmbed.CreateEmbedding(ctx, []string{cr.Choices[0].Content})
+	if err != nil {
+		return fmt.Errorf("create embedding: %w", err)
+	}
+
+	// -------------------------------------------------------------------------
+
+	fmt.Print("Inserting image description into the database:\n\n")
 
 	d1 := document{
 		FileName:    imagePath,
-		Description: results,
-		Embedding:   vector,
+		Description: cr.Choices[0].Content,
+		Embedding:   vectors[0],
 	}
 
 	res, err := col.InsertOne(ctx, d1)
 	if err != nil {
-		return fmt.Errorf("col.InsertOne: %w", err)
+		return fmt.Errorf("insert: %w", err)
 	}
 
-	fmt.Printf("%s\n", res.InsertedID)
+	fmt.Printf("Inserted db id: %s\n\n", res.InsertedID)
 
 	// We need to give mongodb some time to index the document.
 	// There is no way to know when this gets done.
@@ -157,171 +198,64 @@ func run() error {
 
 	// -------------------------------------------------------------------------
 
-	fmt.Println("\nAsk a single question about images:")
+	fmt.Print("Ask a single question about images:\n\n")
 
 	question := "Do you have any images of roses?"
-	fmt.Printf("%s\n", question)
+	fmt.Printf("Question: %s\n\n", question)
 
-	// -------------------------------------------------------------------------
+	fmt.Print("Performing vector search:\n\n")
 
-	fmt.Println("\nPerforming vector search:")
+	ctx, cancel := context.WithTimeout(context.Background(), 240*time.Second)
+	defer cancel()
 
-	searchResults, err := vectorSearch(ctx, llmEmbed, col, question)
+	results, err := vectorSearch(ctx, llmEmbed, col, question)
 	if err != nil {
 		return fmt.Errorf("vectorSearch: %w", err)
 	}
 
-	for _, result := range searchResults {
-		fmt.Printf("FileName[%s] Score[%.2f]\n", result.FileName, result.Score)
-	}
+	fmt.Print("Providing response:\n\n")
 
-	// -------------------------------------------------------------------------
-
-	fmt.Println("\nProviding response")
-
-	if err := questionResponse(ctx, llmChat, question, searchResults); err != nil {
+	if err := questionResponse(ctx, llm, question, results); err != nil {
 		return fmt.Errorf("questionResponse: %w", err)
 	}
 
-	// -------------------------------------------------------------------------
-
-	fmt.Println("\n\nDONE")
+	fmt.Println("DONE")
 	return nil
 }
 
-func readImage(fileName string) ([]byte, string, error) {
-	data, err := os.ReadFile(fileName)
-	if err != nil {
-		return nil, "", fmt.Errorf("read file: %w", err)
-	}
-
-	switch mimeType := http.DetectContentType(data); mimeType {
-	case "image/jpeg", "image/png":
-		return data, mimeType, nil
-	default:
-		return nil, "", fmt.Errorf("unsupported file type: %s: filename: %s", mimeType, fileName)
-	}
-}
-
-func questionResponse(ctx context.Context, llm *client.LLM, question string, results []searchResult) error {
-	type searchResult struct {
-		FileName    string `json:"file_name"`
-		Description string `json:"image_description"`
-	}
-
-	fmt.Println("\nUsing these vectors:")
-
-	var finalResults []searchResult
-
-	for _, result := range results {
-		if result.Score >= 0.75 {
-			fmt.Printf("FileName[%s] Score[%.2f]\n", result.FileName, result.Score)
-			finalResults = append(finalResults, searchResult{
-				FileName:    result.FileName,
-				Description: result.Description,
-			})
-		}
-	}
-
-	content, err := json.Marshal(finalResults)
-	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
-	}
+func initDatabase(dbName string, collectionName string) (*mongo.Client, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	// -------------------------------------------------------------------------
-	// Let's ask the LLM to provide a response
+	// Connect to mongo
 
-	prompt := `
-		INSTRUCTIONS:
-		
-		- Use the following RESULTS to answer the user's question.
-
-		- The data will be a JSON array with the following fields:
-		
-		[
-			{
-				"file_name":string,
-				"image_description":string
-			},
-			{
-				"file_name":string,
-				"image_description":string
-			}
-		]
-
-		- The response should be in a JSON array with the following fields:
-		
-		[
-			{
-				"status": string,
-				"filename": string,
-				"description": string
-			},
-			{
-				"status": string,
-				"filename": string,
-				"description": string
-			}
-		]
-
-		- If there are no RESULTS, provide this response:
-		
-		[
-			{
-				"status": "not found"
-			}
-		]
-
-		- Do not change anything related to the file_name provided.
-		- Only provide a brief description of the image.
-		- Only provide a valid JSON response.
-
-		RESULTS:
-		
-		%s
-			
-		QUESTION:
-		
-		%s
-	`
-
-	finalPrompt := fmt.Sprintf(prompt, string(content), question)
-
-	ch, err := llm.ChatCompletionsSSE(ctx, finalPrompt)
+	client, err := mongodb.Connect(ctx, "mongodb://localhost:27017", "ardan", "ardan")
 	if err != nil {
-		return fmt.Errorf("chat completions: %w", err)
+		return nil, fmt.Errorf("connectToMongo: %w", err)
 	}
 
-	fmt.Println("\nModel Response:")
+	fmt.Println("\nConnected to MongoDB")
 
-	for resp := range ch {
-		fmt.Print(resp.Choices[0].Delta.Content)
-	}
+	// -------------------------------------------------------------------------
+	// Create database and collection
 
-	return nil
-}
-
-// =============================================================================
-
-type searchResult struct {
-	FileName    string    `bson:"file_name" json:"file_name"`
-	Description string    `bson:"description" json:"image_description"`
-	Embedding   []float64 `bson:"embedding" json:"-"`
-	Score       float64   `bson:"score" json:"-"`
-}
-
-func initDB(ctx context.Context, client *mongo.Client) (*mongo.Collection, error) {
 	db := client.Database(dbName)
 
-	col, err := mongodb.CreateCollection(ctx, db, colName)
+	col, err := mongodb.CreateCollection(ctx, db, collectionName)
 	if err != nil {
 		return nil, fmt.Errorf("createCollection: %w", err)
 	}
 
+	fmt.Println("Created Collection")
+
+	// -------------------------------------------------------------------------
+	// Create vector index
+
 	const indexName = "vector_index"
 
 	settings := mongodb.VectorIndexSettings{
-		NumDimensions: dimensions,
+		NumDimensions: 1024,
 		Path:          "embedding",
 		Similarity:    "cosine",
 	}
@@ -330,31 +264,152 @@ func initDB(ctx context.Context, client *mongo.Client) (*mongo.Collection, error
 		return nil, fmt.Errorf("createVectorIndex: %w", err)
 	}
 
+	fmt.Println("Created Vector Index")
+
+	// -------------------------------------------------------------------------
+	// Apply a unique index just to be safe.
+
 	unique := true
 	indexModel := mongo.IndexModel{
-		Keys:    bson.D{{Key: "id", Value: 1}},
+		Keys:    bson.D{{Key: "file_name", Value: 1}},
 		Options: &options.IndexOptions{Unique: &unique},
 	}
-	col.Indexes().CreateOne(ctx, indexModel)
+	if _, err := col.Indexes().CreateOne(ctx, indexModel); err != nil {
+		return nil, fmt.Errorf("createUniqueIndex: %w", err)
+	}
 
-	return col, nil
+	fmt.Println("Created Unique file_name Index")
+
+	return client, nil
 }
 
-func vectorSearch(ctx context.Context, llm *client.LLM, col *mongo.Collection, question string) ([]searchResult, error) {
-	vector, err := llm.EmbedText(ctx, question)
+func processImage(fileName string) ([]byte, string, error) {
+	data, err := readImage(fileName)
 	if err != nil {
-		return nil, fmt.Errorf("embed text: %w", err)
+		return nil, "", fmt.Errorf("read image: %w", err)
 	}
+
+	var mimeType string
+	switch filepath.Ext(fileName) {
+	case ".jpg", ".jpeg":
+		mimeType = "image/jpg"
+	case ".png":
+		mimeType = "image/png"
+	default:
+		return nil, "", fmt.Errorf("unsupported file type: %s", filepath.Ext(fileName))
+	}
+
+	return data, mimeType, nil
+}
+
+func readImage(fileName string) ([]byte, error) {
+	f, err := os.OpenFile(fileName, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, fmt.Errorf("open file: %w", err)
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return nil, fmt.Errorf("read file: %w", err)
+	}
+
+	return data, nil
+}
+
+func updateImage(fileName string, description string) error {
+	im, err := exifcommon.NewIfdMappingWithStandard()
+	if err != nil {
+		return fmt.Errorf("new idf mapping: %w", err)
+	}
+
+	ti := exif.NewTagIndex()
+	ib := exif.NewIfdBuilder(im, ti, exifcommon.IfdStandardIfdIdentity, exifcommon.EncodeDefaultByteOrder)
+
+	err = ib.AddStandardWithName("ImageDescription", description)
+	if err != nil {
+		return fmt.Errorf("add standard: %w", err)
+	}
+
+	// -------------------------------------------------------------------------
+
+	switch filepath.Ext(fileName) {
+	case ".jpg", ".jpeg":
+		intfc, err := jpg.NewJpegMediaParser().ParseFile(fileName)
+		if err != nil {
+			return fmt.Errorf("parse file: %w", err)
+		}
+
+		cs := intfc.(*jpg.SegmentList)
+		err = cs.SetExif(ib)
+		if err != nil {
+			return fmt.Errorf("set ib: %w", err)
+		}
+
+		f, err := os.Create(fileName)
+		if err != nil {
+			return fmt.Errorf("create: %w", err)
+		}
+
+		err = cs.Write(f)
+		if err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+		defer f.Close()
+
+	case ".png":
+		intfc, err := pis.NewPngMediaParser().ParseFile(fileName)
+		if err != nil {
+			return fmt.Errorf("parse file: %w", err)
+		}
+
+		cs := intfc.(*pis.ChunkSlice)
+		err = cs.SetExif(ib)
+		if err != nil {
+			return fmt.Errorf("set ib: %w", err)
+		}
+
+		f, err := os.Create(fileName)
+		if err != nil {
+			return fmt.Errorf("create: %w", err)
+		}
+
+		err = cs.WriteTo(f)
+		if err != nil {
+			return fmt.Errorf("write: %w", err)
+		}
+		defer f.Close()
+
+	default:
+		return fmt.Errorf("unsupported file type: %s", filepath.Ext(fileName))
+	}
+
+	return nil
+}
+
+func vectorSearch(ctx context.Context, llm *ollama.LLM, col *mongo.Collection, question string) ([]searchResult, error) {
+
+	// -------------------------------------------------------------------------
+	// Get the vector embedding for the question.
+
+	embedding, err := llm.CreateEmbedding(ctx, []string{question})
+	if err != nil {
+		return nil, fmt.Errorf("create embedding: %w", err)
+	}
+
+	// -------------------------------------------------------------------------
+	// We want to find the nearest neighbors from the question vector embedding.
 
 	pipeline := mongo.Pipeline{
 		{{
 			Key: "$vectorSearch",
 			Value: bson.M{
-				"index":       "vector_index",
-				"exact":       true,
-				"path":        "embedding",
-				"queryVector": vector,
-				"limit":       5,
+				"index":         "vector_index",
+				"exact":         false,
+				"path":          "embedding",
+				"queryVector":   embedding[0],
+				"numCandidates": 5,
+				"limit":         5,
 			}},
 		},
 		{{
@@ -376,10 +431,135 @@ func vectorSearch(ctx context.Context, llm *client.LLM, col *mongo.Collection, q
 	}
 	defer cur.Close(ctx)
 
+	// -------------------------------------------------------------------------
+	// Return and display the results.
+
 	var results []searchResult
 	if err := cur.All(ctx, &results); err != nil {
 		return nil, fmt.Errorf("all: %w", err)
 	}
 
+	for _, result := range results {
+		fmt.Printf("FileName[%s] Score[%.2f]\n", result.FileName, result.Score)
+	}
+
+	fmt.Print("\n")
+
 	return results, nil
+}
+
+func questionResponse(ctx context.Context, llm *ollama.LLM, question string, results []searchResult) error {
+
+	// -------------------------------------------------------------------------
+	// Let's filter the results to only include the ones with a score above 0.75.
+	// We don't need to include the score or embeddings in the final results.
+
+	type searchResult struct {
+		FileName    string `json:"file_name"`
+		Description string `json:"image_description"`
+	}
+
+	var finalResults []searchResult
+
+	fmt.Print("Data:\n\n")
+	for _, result := range results {
+		if result.Score >= 0.75 {
+			fmt.Printf("FileName[%s] Score[%.2f]\n", result.FileName, result.Score)
+			finalResults = append(finalResults, searchResult{
+				FileName:    result.FileName,
+				Description: result.Description,
+			})
+		}
+	}
+
+	content, err := json.Marshal(finalResults)
+	if err != nil {
+		return fmt.Errorf("marshal: %w", err)
+	}
+
+	// -------------------------------------------------------------------------
+	// Let's ask the LLM to provide a response
+
+	prompt := `
+	INSTRUCTIONS:
+	
+	- Use the following RESULTS to answer the user's question.
+
+	- The data will be a JSON array with the following fields:
+	
+	[
+		{
+			"file_name":string,
+			"image_description":string
+		},
+		{
+			"file_name":string,
+			"image_description":string
+		}
+	]
+
+	- The response should be in a JSON array with the following fields:
+	
+	[
+		{
+			"status": string,
+			"filename": string,
+			"description": string
+		},
+		{
+			"status": string,
+			"filename": string,
+			"description": string
+		}
+	]
+
+	- If there are no RESULTS, provide this response:
+	
+	[
+		{
+			"status": "not found"
+		}
+	]
+
+	- Do not change anything related to the file_name provided.
+	- Only provide a brief description of the image.
+	- Only provide a valid JSON response.
+
+	RESULTS:
+	
+	%s
+		
+	QUESTION:
+	
+	%s
+	`
+
+	finalPrompt := fmt.Sprintf(prompt, string(content), question)
+
+	// This function will display the response as it comes from the server.
+	f := func(ctx context.Context, chunk []byte) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		fmt.Printf("%s", chunk)
+		return nil
+	}
+
+	fmt.Print("\nResults:\n\n")
+
+	// Send the prompt to the model server.
+	_, err = llm.Call(
+		ctx,
+		finalPrompt,
+		llms.WithStreamingFunc(f),
+		llms.WithMaxTokens(500),
+	)
+	if err != nil {
+		return fmt.Errorf("call: %w", err)
+	}
+
+	fmt.Printf("\n\n")
+
+	return nil
 }
